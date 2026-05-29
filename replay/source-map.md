@@ -20,9 +20,24 @@
 | replay 完成位置 | `src/backend/access/transam/xlogrecovery.c` | `GetXLogReplayRecPtr()` | 返回最后成功 replay 的 end LSN。 |
 | 当前 replay 位置 | `src/backend/access/transam/xlogrecovery.c` | `GetCurrentReplayRecPtr()` | 包含正在应用中的 record。 |
 | redo 函数注册表 | `src/include/access/rmgrlist.h` | `PG_RMGR(...)` | WAL record 的 resource manager 到 redo 函数的映射。 |
+| rmgr ID 定义 | `src/include/access/rmgr.h` | `RmgrId` | WAL record 所属 resource manager 的编号类型。 |
+| rmgr 回调表结构 | `src/include/access/xlog_internal.h` | `RmgrData` / `GetRmgr()` | 定义 `rm_redo`、`rm_desc` 等回调，并按 `RmgrId` 取出 rmgr 元信息。 |
+| rmgr 表初始化和扩展 | `src/backend/access/transam/rmgr.c` | `RmgrTable` / `RegisterCustomRmgr()` / `RmgrStartup()` / `RmgrCleanup()` | 建立内置 rmgr 表，并支持自定义 rmgr 注册。 |
+| WAL record 结构 | `src/include/access/xlogrecord.h` / `src/include/access/xlogreader.h` | `XLogRecord` / `XLogReaderState` / `DecodedBkpBlock` | WAL header、main data、block references 和 FPI 解码。 |
+| redo 读页公共逻辑 | `src/backend/access/transam/xlogutils.c` | `XLogReadBufferForRedo()` / `XLogReadBufferForRedoExtended()` | 定位 block、处理 FPI、page LSN 判断、返回 redo action。 |
+| heap redo | `src/backend/access/heap/heapam_xlog.c` | `heap_redo()` / `heap_xlog_insert()` / `heap_xlog_update()` / `heap_xlog_delete()` | heap insert/update/delete 的页面级恢复。 |
+| btree redo | `src/backend/access/nbtree/nbtxlog.c` | `btree_redo()` / `btree_xlog_insert()` / `btree_xlog_split()` | btree insert/split 等索引页面恢复。 |
+| page LSN | `src/include/storage/bufpage.h` | `PageGetLSN()` / `PageSetLSN()` | redo 幂等判断和页面恢复边界。 |
+| smgr 接口 | `src/include/storage/smgr.h` | `SMgrRelationData` / `smgropen()` / `smgrcreate()` / `smgrread()` / `smgrwrite()` / `smgrnblocks()` / `smgrtruncate()` | relation 物理文件、fork、block I/O 的 storage manager 抽象。 |
+| smgr 抽象层实现 | `src/backend/storage/smgr/smgr.c` | `smgropen()` / `smgrdestroy()` | 缓存和管理 `SMgrRelation`，向上提供 storage manager 接口。 |
+| smgr 磁盘实现 | `src/backend/storage/smgr/md.c` | `mdcreate()` / `mdextend()` / `mdreadv()` / `mdwritev()` / `mdnblocks()` / `mdtruncate()` | 默认磁盘文件和 segment 级别的具体实现。 |
+| relation 到 smgr | `src/include/utils/rel.h` | `RelationGetSmgr()` | 把 relcache 中的 relation 绑定到 `SMgrRelation`。 |
+| SMGR WAL 记录和 redo | `src/include/catalog/storage_xlog.h` / `src/backend/catalog/storage.c` | `log_smgrcreate()` / `smgr_redo()` / `xl_smgr_create` / `xl_smgr_truncate` | relation storage create/truncate 这类物理存储操作的 WAL 和恢复逻辑。 |
 | 主机发送 WAL | `src/backend/replication/walsender.c` | `WalSndLoop()` / `XLogSendPhysical()` / `WalSndWaitForWal()` | walsender 等待并发送物理 WAL。 |
 | 备机接收 WAL | `src/backend/replication/walreceiver.c` | `WalReceiverMain()` / `XLogWalRcvProcessMsg()` | walreceiver 主循环和消息处理。 |
 | 备机写入 WAL | `src/backend/replication/walreceiver.c` | `XLogWalRcvWrite()` / `XLogWalRcvFlush()` | 把接收的 WAL 写入并 flush 到备机 `pg_wal`。 |
+| recovery prefetch | `src/backend/access/transam/xlogprefetcher.c` | `XLogPrefetcherReadRecord()` / `XLogPrefetcherBeginRead()` | 恢复期间提前读取后续 redo 可能访问的数据块。 |
+| recovery prefetch 配置 | `src/include/access/xlogprefetcher.h` / `doc/src/sgml/config.sgml` | `recovery_prefetch` / `wal_decode_buffer_size` | 控制恢复预读是否启用以及向前解析 WAL 的窗口。 |
 
 ## 指针速查
 
