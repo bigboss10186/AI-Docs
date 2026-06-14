@@ -1,21 +1,19 @@
-# Postgres Study Docs
+# AI Docs Library
 
-这个目录用于沉淀当前 PostgreSQL 代码仓的学习文档和可复用 skill。
+这个目录作为面向 AI/Codex 协作的文档库入口。第一层目录按项目、代码库或知识域拆分，便于后续继续加入其他文档集合。
 
-## 目录结构
+## 文档集合
 
-- `replay/`: WAL redo/replay、checkpoint、restartpoint、WAL insert 指针推进等专题。
-- `skills/`: 后续可以放面向 Codex/Agent 的工作流、阅读模板、调试手册。
+- [algorithms](algorithms/README.md): 算法与工程实践中的复杂度优化、数据结构选择和解题模式。
+- [postgres](postgres/README.md): PostgreSQL 内核学习文档、专题阅读路径和可复用 skill。
 
-## 阅读方式
+## 组织约定
 
-每个专题尽量包含三层内容：
+每个一层目录建议保持相对独立：
 
-1. 概念总览：先解释机制和关键术语。
-2. 交互细节：描述多个机制之间如何互相影响。
-3. 源码坐标：定位到当前仓库里的文件、函数和关键代码段。
+1. `README.md`: 当前文档集合的入口、阅读顺序和核心索引。
+2. `topics/` 或专题目录: 存放按主题拆分的长文档。
+3. `skills/`: 存放面向 AI Agent 的可复用阅读、调试或生成流程。
+4. `references/`: 可选，存放外部资料、源码坐标和术语表。
 
-当前第一版专题：
-
-- [WAL 回放专题入口](replay/README.md)
-
+新增文档集合时，优先在 `docs/` 下创建新的一级目录，再从这里加入口链接。
