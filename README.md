@@ -5,6 +5,7 @@
 ## 文档集合
 
 - [algorithms](algorithms/README.md): 算法与工程实践中的复杂度优化、数据结构选择和解题模式。
+- [gaussdb](gaussdb/README.md): GaussDB/openGauss 相关源码分析、分布式部署和故障排查笔记。
 - [postgres](postgres/README.md): PostgreSQL 内核学习文档、专题阅读路径和可复用 skill。
 
 ## 组织约定
