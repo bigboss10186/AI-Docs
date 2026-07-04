@@ -18,3 +18,11 @@
 4. `references/`: 可选，存放外部资料、源码坐标和术语表。
 
 新增文档集合时，优先在 `docs/` 下创建新的一级目录，再从这里加入口链接。
+
+## 数据库内核笔记归档规则
+
+当前数据库学习笔记按“共通概念”和“项目特有概念”分层：
+
+1. PostgreSQL 和 openGauss/GaussDB 都适用的基础概念，优先放到 `postgres/`。例如 page、tuple、heap、btree、WAL/XLOG、rmgr、smgr、checkpoint、redo。
+2. openGauss/GaussDB 特有或明显扩展的内容，放到 `gaussdb/`。例如 ASTORE、USTORE、CStore、D-Store、uheap、ubtree、undo worker、GaussDB 部署和回放差异。
+3. 如果一个主题既有共通概念又有 openGauss 特化实现，先在 `postgres/` 写通用模型，再在 `gaussdb/` 写差异和源码坐标，并互相链接。
