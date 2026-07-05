@@ -636,9 +636,3 @@ TBLSPCDIR/pg_tblspc 共享：
 ```
 
 如果商业版和公开 openGauss 不一致，尤其是 `check_tablespace_symlink()` 在 recovery 中没有跳过，或者扫描范围不再局限于当前实例的 `TBLSPCDIR`，就应该把它作为高优先级根因继续验证。
-
-```
-
-
-```
-
