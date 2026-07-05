@@ -37,7 +37,7 @@ SQL / Executor
 - CStore 是列存，重点差异在数据按列组织、压缩、向量化扫描和分析查询性能。
 - D-Store 的定位更大，它看起来不是简单的 `storage_type=dstore`，而是面向云原生和 page store 场景的一套独立存储内核。
 
-更通用的存储层分层可以先看 PostgreSQL 专区的 [存储层概念分层](../../postgres/storage/README.md)。这里先给一个 openGauss 视角的速记：
+更通用的存储层分层可以先看 PostgreSQL 专区的 [存储层概念分层](../../postgres/storage/storage-layer-concepts.md)。这里先给一个 openGauss 视角的速记：
 
 ```text
 SQL 操作类型:

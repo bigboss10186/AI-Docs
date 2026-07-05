@@ -4,7 +4,7 @@
 
 ## 专题
 
-- [复杂度节省技巧](complexity-saving-patterns/README.md): 总结工程和算法中常见的复杂度优化思路，重点关注如何用更合适的数据结构、状态表示和计算方式减少时间或空间开销。
+- [复杂度节省技巧](complexity-saving-patterns/complexity-saving-patterns.md): 总结工程和算法中常见的复杂度优化思路，重点关注如何用更合适的数据结构、状态表示和计算方式减少时间或空间开销。
 
 ## 组织方向
 
