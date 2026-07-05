@@ -5,6 +5,7 @@
 ## 文档集合
 
 - [algorithms](algorithms/README.md): 算法与工程实践中的复杂度优化、数据结构选择和解题模式。
+- [codex](codex/README.md): OpenAI Codex 代码仓阅读索引，重点梳理 `codex-rs/` 的 Rust workspace 分层、目录职责和阅读路径。
 - [diagnostics](diagnostics/README.md): 数据库问题定位、故障分析和案例复盘。
 - [gaussdb](gaussdb/README.md): GaussDB/openGauss 相关源码分析、分布式部署和故障排查笔记。
 - [postgres](postgres/README.md): PostgreSQL 内核学习文档、专题阅读路径和可复用 skill。
@@ -24,6 +25,6 @@
 
 当前数据库学习笔记按“共通概念”和“项目特有概念”分层：
 
-1. PostgreSQL 和 openGauss/GaussDB 都适用的基础概念，优先放到 `postgres/`。例如 page、tuple、heap、btree、WAL/XLOG、rmgr、smgr、checkpoint、redo。
+1. PostgreSQL 和 openGauss/GaussDB 都适用的基础概念，优先放到 `postgres/`。例如 page、tuple、heap、btree、WAL/XLOG、VACUUM、rmgr、smgr、checkpoint、redo。
 2. openGauss/GaussDB 特有或明显扩展的内容，放到 `gaussdb/`。例如 ASTORE、USTORE、CStore、D-Store、uheap、ubtree、undo worker、GaussDB 部署和回放差异。
 3. 如果一个主题既有共通概念又有 openGauss 特化实现，先在 `postgres/` 写通用模型，再在 `gaussdb/` 写差异和源码坐标，并互相链接。
