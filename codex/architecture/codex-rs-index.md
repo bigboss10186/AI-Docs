@@ -1,4 +1,4 @@
-# Codex Study Docs
+# Codex Rust Workspace Index
 
 这个目录用于沉淀 OpenAI Codex 代码仓的阅读笔记，当前重点是 `codex-rs/` 这个 Rust workspace。它可以作为后续深入阅读源码时的索引：先知道有哪些层、每一层负责什么，再按问题去定位对应 crate 和目录。
 
