@@ -347,9 +347,9 @@ undo 清理:
 | USTORE 不需要清理 | USTORE 仍需要 uheap prune/vacuum 和 undo recycle |
 | 索引会自动马上删除死项 | 很多索引死项依赖 VACUUM 或索引清理流程 |
 
-## 11. 学习路线
+## 11. 概念清单
 
-建议按这个顺序读：
+这个专题涉及以下关键概念：
 
 1. `UPDATE/DELETE` 如何产生旧版本。
 2. `HeapTupleSatisfiesVacuum` 如何判断 tuple 能不能清理。

@@ -1,8 +1,8 @@
-# WAL Replay Study
+# WAL Replay Notes
 
 这个专题用于理解 PostgreSQL 的 WAL 回放整体概念，以及 checkpoint、restartpoint、WAL insert 指针推进之间的关系。
 
-## 推荐阅读顺序
+## 文档索引
 
 1. [主备 WAL 全链路流程图](overview-flow.md)
 2. [Checkpoint 基本原理](concepts/checkpoint.md)

@@ -183,9 +183,9 @@ ReadRecord()
   recovery 读到 heap WAL record，再调用 heap_redo() 修复 heap page
 ```
 
-## 6. 学习路线
+## 6. 概念索引
 
-建议按这个顺序理解存储层：
+存储层可以按下面这些概念分组归档：
 
 1. Page：数据库最基本的读写单位。
 2. Tuple：行在 page 里怎么存。
@@ -195,7 +195,7 @@ ReadRecord()
 6. WAL/XLOG：修改如何持久化和恢复。
 7. VACUUM/undo recycle：历史版本和空间如何清理，详见 [Page Prune、VACUUM、TRUNCATE 与空间回收](cleanup.md)。
 
-读源码时也可以按这个顺序追：
+读源码时可以关注下面这条典型调用关系：
 
 ```text
 INSERT/UPDATE/DELETE
