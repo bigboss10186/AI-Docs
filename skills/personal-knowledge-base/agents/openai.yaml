@@ -1,0 +1,4 @@
+interface:
+  display_name: "Personal Knowledge Base"
+  short_description: "Navigate and maintain this docs knowledge base"
+  default_prompt: "Use $personal-knowledge-base to add or organize a note in my docs knowledge base."
