@@ -23,3 +23,4 @@
 - [Codex Rust Workspace 分层索引](../codex/architecture/codex-rs-index.md)
 - [Codex 记忆系统实现分析](../codex/memory/codex-memory-system.md)
 - [Replay 源码地图](../postgres/replay/source-map.md)
+- [openGauss DCF 模式下 XLog Entry 的切分、传输与落盘流程](../gaussdb/replication/dcf-xlog-transport-flow.md)

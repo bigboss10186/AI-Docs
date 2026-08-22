@@ -21,6 +21,7 @@
 - [Page Prune、VACUUM、TRUNCATE 与空间回收](../postgres/storage/cleanup.md)
 - [WAL 回放专题](../postgres/replay/wal-replay-study.md)
 - [Replay 源码地图](../postgres/replay/source-map.md)
+- [openGauss DCF 模式下 XLog Entry 的切分、传输与落盘流程](../gaussdb/replication/dcf-xlog-transport-flow.md)
 - [openGauss/GaussDB 存储引擎分析](../gaussdb/storage-engines/storage-engines.md)
 - [表空间回放软链接冲突分析](../diagnostics/gaussdb/tablespace-symlink-replay.md)
 

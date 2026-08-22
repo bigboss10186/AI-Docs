@@ -11,6 +11,7 @@
 5. [WAL Record 如何作用到 Page](features/page-redo-flow.md)
 6. [WAL insert head/tail 与写入推进](concepts/insert-pointers.md)
 7. [源码地图](source-map.md)
+8. [openGauss DCF 模式下 XLog Entry 的切分、传输与落盘流程](../../gaussdb/replication/dcf-xlog-transport-flow.md)
 
 ## 核心结论
 
@@ -23,6 +24,7 @@
 - 按 redo 执行模型看，PostgreSQL 社区版核心是 startup process 串行回放；`recovery_prefetch` 是 I/O 预读优化，不是并行 redo。
 - `rmgr` 是 WAL record 的资源管理器分发层；`smgr` 是 relation 物理文件和 block I/O 的 storage manager 抽象，`RM_SMGR_ID` 是二者在 WAL redo 体系中的连接点。
 - 页面级 redo 的核心链路是：解析 WAL record -> 按 RmgrId 分发 -> 定位 relation/fork/block -> 处理 FPI 或 page LSN 判断 -> 修改 page -> 设置 LSN、标脏、释放 buffer。
+- openGauss DCF 模式中，一次 `dcf_write()` 对应一个 DCF entry/index；约 1 MiB 的 WAL 切分发生在 `XLogWritePaxos()`，MEC 网络 fragment 会在 follower 上重组，而 walreceiverwriter 的 `nbytes` 可能再次合并或拆分 entry。
 
 ## 外部背景资料
 
