@@ -6,11 +6,13 @@
 
 - 存储引擎: ASTORE、USTORE、CStore、D-Store。
 - openGauss 特有机制: uheap、ubtree、undo worker、节点目录隔离等。
+- 复制与高可用: DCF、Paxos WAL 传输、日志落盘和回调链路。
 - 与 PostgreSQL 的差异: 数据组织、更新模型、MVCC/undo、WAL/replay 行为。
 
 ## 已归档笔记
 
 - [openGauss/GaussDB 存储引擎分析](storage-engines/storage-engines.md): 对比 ASTORE、USTORE、CStore、D-Store 的数据组织、更新模型、MVCC/undo、列存 CU、page/TD 结构和适用场景。
+- [DCF 模式下 XLog Entry 的切分、传输与落盘流程](replication/dcf-xlog-transport-flow.md): 梳理 1 MiB WAL 切分、DCF entry/index、AppendLog/MEC 网络重组、回调、walreceiver 环形缓冲以及 CRC 校验边界。
 
 ## 相关案例
 
