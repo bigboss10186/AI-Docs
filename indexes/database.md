@@ -22,6 +22,7 @@
 - [WAL 回放专题](../postgres/replay/wal-replay-study.md)
 - [Replay 源码地图](../postgres/replay/source-map.md)
 - [openGauss DCF 模式下 XLog Entry 的切分、传输与落盘流程](../gaussdb/replication/dcf-xlog-transport-flow.md)
+- [openGauss DCF 模式下 XLog CRC 偶现失败调试手册](../gaussdb/replication/dcf-xlog-crc-debugging.md)
 - [openGauss/GaussDB 存储引擎分析](../gaussdb/storage-engines/storage-engines.md)
 - [表空间回放软链接冲突分析](../diagnostics/gaussdb/tablespace-symlink-replay.md)
 
