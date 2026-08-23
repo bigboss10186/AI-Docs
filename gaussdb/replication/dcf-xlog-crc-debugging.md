@@ -386,6 +386,170 @@ xlp_rem_len
 
 仅凭字节内容无法可靠判断。安全策略是放弃当前 page 剩余部分，从下一个可验证的 page header 开始重新同步。这样可能少校验一条 record，但不会把 body 中的四个字节误当成 `xl_tot_len`。
 
+## `original_wal_len` 的来源
+
+### 开源标准路径
+
+标准 openGauss/DCF 中，`original_wal_len` 不是新增推导值，它就是 `XLogWritePaxos()` 传给 `dcf_write()` 的 `nBytes`。长度沿调用链原样传递：
+
+```text
+XLogWritePaxos
+  nBytes
+    ↓
+dcf_write(buffer, length = nBytes, key = WriteLSN)
+    ↓
+rep_write(buffer, length, key)
+    ↓
+stg_append_entry(..., size = length, key)
+    ↓
+stream_append_entry(..., size)
+    ↓
+IO_BUF_SIZE(entry) = size
+    ↓
+ENTRY_SIZE(entry) = original_wal_len
+```
+
+同时：
+
+```c
+WriteLSN = LogwrtPaxos->Write + nBytes;
+dcf_write(1, from, nBytes, WriteLSN, &paxosIdx);
+```
+
+因此标准完整 payload 版本满足：
+
+```text
+original_wal_len = nBytes = ENTRY_SIZE(entry)
+entry_end_lsn    = ENTRY_KEY(entry) = WriteLSN
+entry_start_lsn  = entry_end_lsn - original_wal_len
+```
+
+### 私有 header-only 路径
+
+header-only 优化后必须区分：
+
+```text
+original_wal_len：最初 dcf_write() 的 WAL payload 长度
+stored_reference_len：DCF segment 文件中实际保存的引用 header 长度
+assembled_send_len：发送前从本地 WAL 重建出的最终 payload 长度
+```
+
+正确关系应当是：
+
+```text
+original_wal_len == assembled_send_len
+stored_reference_len 可以更小
+```
+
+私有实现可能采用以下任一种方式保存 `original_wal_len`：
+
+- 保留 `IO_BUF_SIZE/ENTRY_SIZE` 的原始逻辑语义，只让 segment 物理存储长度使用另一个字段；
+- 在自定义引用 header 中增加 `original_size/wal_len`；
+- 同时保存 start/end LSN，通过 `end_lsn - start_lsn` 恢复长度；
+- 根据相邻 entry key 推导 start LSN，但这种方式对截断、缺 entry 和配置 entry 更敏感。
+
+不能仅凭字段名判断。核对非公开版本时，应从最初的 `dcf_write(length)` 开始，逐层跟踪：
+
+```text
+dcf_write.length
+  → rep_write.length
+  → stream_append_entry.size
+  → 持久化引用header中的长度字段
+  → segment_get_entry读取时的物理分配长度
+  → body重建使用的WAL长度
+  → stg_get_entry返回后的ENTRY_SIZE
+  → rep_encode_one_log/mec_put_bin最终发送长度
+  → 内核CRC回调长度
+```
+
+对同一个 `index/key`，建议临时打印上述关键阶段的长度。内核 CRC 回调必须使用与最终 `mec_put_bin()` 完全相同的 WAL `buf/len`，而不是 DCF segment 的物理存储长度。
+
+## 为什么标准 DCF entry 不拆开四字节 `xl_tot_len`
+
+这个结论依赖当前标准 `XLogWritePaxos()` 的全部截断来源，而不只是 1 MiB 上限。
+
+每轮先计算：
+
+```c
+WriteTotal = PaxosWriteRqst - LogwrtPaxos->Write;
+
+CriticalNBytes =
+    从当前WAL cache位置到cache数组末尾的连续物理字节数;
+
+nBytes = Min(WriteTotal,
+             Min(MaxSendSizeBytes, CriticalNBytes));
+```
+
+`nBytes` 的实际限制来源有三种：
+
+| 限制来源 | 当前代码中的 entry end | 是否可能拆四字节 `xl_tot_len` |
+| --- | --- | --- |
+| `WriteTotal` 最小 | `PaxosWriteRqst` | 当前两个调用点传入完整 WAL copy status 的 `endLSN`，或者大 record copy 到达的物理 page boundary |
+| `MaxSendSizeBytes` 最小 | 显式减去 `tmpLsn % XLOG_BLCKSZ`，回退到物理 page boundary | 不会；record 起始页保证至少容纳四字节 |
+| `CriticalNBytes` 最小 | WAL cache 数组末尾；根据公式，物理 LSN offset 回到 page boundary | 不会；同样落在物理 page boundary |
+
+当前两个 `XLogWritePaxos()` 调用来源是：
+
+1. WAL background flush 使用 `curr_entry_ptr->endLSN`。它是已经完成 WAL copy 的状态项末尾，不是任意输入 buffer 位置；
+2. `XLogSelfFlushWithoutStatus()` 在复制超大 record、WAL buffer 环回时传入 `currPos`。调用发生前已把当前 page 的 `freespace` 全部复制完，因此 `currPos` 位于物理 WAL page boundary。
+
+WAL insert 端同时保证：
+
+```c
+Assert(freespace >= sizeof(uint32));
+```
+
+也就是一条新 record 开始时，其起始 page 一定可以完整放下四字节 `xl_tot_len`。于是标准 entry end 只有两类可信位置：
+
+```text
+完整record/copy-status末尾
+物理WAL page boundary
+```
+
+前者不会截断 record；后者即使截断固定 `XLogRecord` header，也已经包含完整的四字节 `xl_tot_len`。所以标准路径下：
+
+```text
+xl_tot_len四字节不会跨两个DCF entry
+固定XLogRecord header的剩余部分仍可能跨两个DCF entry
+record body可以跨多个DCF entry
+```
+
+例如：
+
+```text
+entry N尾部，同时也是page尾部:
+  [完整xl_tot_len][固定header前半部分]
+
+entry N+1:
+  [short/long page header]
+  [固定header剩余部分]
+  [record body]
+```
+
+这项保证只适用于“一个回调输入等于一个完整原始 DCF entry”的发送端。它不适用于：
+
+- walreceiver ring/walRcvWrite 的任意连续区间；
+- MEC fragment；
+- body 重建过程中的单次 `pread`；
+- 私有代码新增的任意字节限流或重新切片。
+
+发送端内核回调如果放在 `stg_get_entry()` 完成全部 body 拼装之后、`rep_encode_one_log()` 之前，并且一次传入完整 `ENTRY_BUF/ENTRY_SIZE`，才可以使用这项 entry 边界保证。
+
+### 非公开版本核对清单
+
+在非公开版本中需要重新确认：
+
+1. `XLogWritePaxos()` 的 `nBytes` 是否仍然只取 `WriteTotal/MaxSendSizeBytes/CriticalNBytes` 三者最小值；
+2. 命中任意发送大小上限时，是否仍然回退到 `XLOG_BLCKSZ` page boundary；
+3. 所有 `XLogWritePaxos()` 调用点传入的是 record/copy-status end，还是新增了任意 LSN；
+4. `dcf_write()` 是否仍然一次调用创建一个 index，内部有没有按更小大小重新切 entry；
+5. header-only 持久化是否保留 `original_wal_len`，有没有把它替换成引用 header 长度；
+6. `stg_get_entry()` 返回前是否已经拼出完整原始 WAL payload；
+7. 内核 CRC 回调是一整个 assembled entry 调用一次，还是每个 `pread`/拼装片段调用一次；
+8. `rep_encode_one_log()` 最终发送的 `buf/len/key` 是否与内核 CRC 回调完全相同。
+
+只要其中一项发生变化，就不能继续假设 `xl_tot_len` 不会跨发送端回调边界。
+
 ## header-only DCF 优化检查
 
 私有实现如果只持久化引用 header，发送时从本地 WAL 文件拼 body，应同时维护两组长度：
@@ -499,6 +663,7 @@ original_nbytes == final_send_len
 - `src/gausskernel/storage/access/transam/xlog.cpp`
   - `CopyXLogRecordToWAL()`：固定 header 可以跨页，起始页只保证容纳 `xl_tot_len`；
   - `XLogWritePaxos()`：DCF entry 的 `buf/nBytes/end LSN` 来源；
+  - `XLogSelfFlushWithoutStatus()`：大 record 写满 page/WAL cache 环回时，以物理 page boundary 推进 Paxos write；
   - DCF 写入与本地 WAL write/flush 顺序。
 - `src/gausskernel/storage/access/transam/xloginsert.cpp`
   - `XLogRecordAssemble()`：形成 `xl_tot_len` 和初始 CRC。
