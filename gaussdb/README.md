@@ -13,6 +13,7 @@
 
 - [openGauss/GaussDB 存储引擎分析](storage-engines/storage-engines.md): 对比 ASTORE、USTORE、CStore、D-Store 的数据组织、更新模型、MVCC/undo、列存 CU、page/TD 结构和适用场景。
 - [DCF 模式下 XLog Entry 的切分、传输与落盘流程](replication/dcf-xlog-transport-flow.md): 梳理 1 MiB WAL 切分、DCF entry/index、AppendLog/MEC 网络重组、回调、walreceiver 环形缓冲以及 CRC 校验边界。
+- [DCF 模式下 XLog CRC 偶现失败调试手册](replication/dcf-xlog-crc-debugging.md): 整理最小诊断日志、重复 core/毒 entry 判定、core/GDB 取证、跨 page 固定 header、header-only body 重建和多阶段 checksum 对比方法。
 
 ## 相关案例
 

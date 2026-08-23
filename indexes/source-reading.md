@@ -24,3 +24,4 @@
 - [Codex 记忆系统实现分析](../codex/memory/codex-memory-system.md)
 - [Replay 源码地图](../postgres/replay/source-map.md)
 - [openGauss DCF 模式下 XLog Entry 的切分、传输与落盘流程](../gaussdb/replication/dcf-xlog-transport-flow.md)
+- [openGauss DCF 模式下 XLog CRC 偶现失败调试手册](../gaussdb/replication/dcf-xlog-crc-debugging.md)

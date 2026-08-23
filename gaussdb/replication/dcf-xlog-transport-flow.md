@@ -8,7 +8,7 @@
 | 类型 | 源码阅读 |
 | 状态 | 可用 |
 | 创建时间 | 2026 年 8 月 22 日 |
-| 更新时间 | 2026 年 8 月 22 日 |
+| 更新时间 | 2026 年 8 月 23 日 |
 
 ## 要回答的问题
 
@@ -588,6 +588,8 @@ start_lsn < expected_lsn
 
 ## 11. 建议的观测日志
 
+本节只列传输链路上的基础观测点。针对偶现 CRC 失败、重复 core、header-only body 重建、core/GDB 取证和最小诊断循环缓冲的完整操作步骤，参见 [DCF 模式下 XLog CRC 偶现失败调试手册](dcf-xlog-crc-debugging.md)。
+
 ### 在 `XLogWritePaxos()` 调用 `dcf_write()` 前
 
 ```text
@@ -733,6 +735,7 @@ leader 在 DCF 中只保存引用 header
 
 ## 相关笔记
 
+- [DCF 模式下 XLog CRC 偶现失败调试手册](dcf-xlog-crc-debugging.md)
 - [WAL 回放专题入口](../../postgres/replay/wal-replay-study.md)
 - [主备 WAL 全链路流程图](../../postgres/replay/overview-flow.md)
 - [WAL insert head/tail 与写入推进](../../postgres/replay/concepts/insert-pointers.md)
