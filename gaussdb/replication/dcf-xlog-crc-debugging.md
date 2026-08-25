@@ -8,709 +8,637 @@
 | 类型 | 排障复盘 |
 | 状态 | 可用 |
 | 创建时间 | 2026 年 8 月 23 日 |
-| 更新时间 | 2026 年 8 月 23 日 |
+| 更新时间 | 2026 年 8 月 26 日 |
 
-## 目标
+## 目标与范围
 
-这篇文档用于定位下面这类问题：
+本文整理 DCF 模式下复用 `check_xlog_buf()` 做 WAL record CRC 校验时，接收端和发送端分别需要满足的边界条件，并记录一次接收端误校验的现有证据、最可能根因和后续取证方法。
 
-- 流复制场景中已经稳定运行的 WAL record CRC 校验逻辑，接入 DCF 发送端或接收端后偶现失败；
-- 发送端在 DCF entry 从内存 cache 取不到、需要从磁盘恢复 WAL body 时进行校验；
-- 接收端在 `walRcvWrite()` 附近根据 `buf/nbytes/start LSN` 增量解析 WAL record 并校验；
-- 同一个故障出现后，接收端进程重启仍然重复 core；
-- 两个备机可能在同一个 WAL 位置同时 core；
-- 私有 DCF 分支采用 header-only 优化，只持久化 entry 引用信息，发送前再从本地 WAL 文件拼装 body。
+当前实现包含两个校验位置：
 
-目标不是一开始就打印所有状态，而是让下一次复现至少能回答三个问题：
+- 接收端：`walreceiverwriter` 从 walreceiver 环形缓冲取出 `buf/nbytes/startPtr`，写盘前调用 `check_xlog_buf()`；
+- 发送端：DCF leader 在 `rep_appendlog_node()` 中逐 index 调用 `stg_get_entry()`，完成私有 header-only WAL body 拼装后、`rep_encode_one_log()` 前调用相同的 `check_xlog_buf()`。
 
-1. 主机写入 DCF、发送端重建和备机接收的物理 WAL 字节是否一致？
-2. 自定义校验器识别出的 record 起点、固定 header 和逻辑长度是否正确？
-3. openGauss 原生 `XLogReader` 是否认可同一个 record？
+发送端的目标是 best-effort：只校验从磁盘读取且能够可靠恢复 record 边界的内容，允许漏校验，但不能因为 entry 不连续而误报 CRC 失败。
 
-## 现象
+DCF entry 的完整切分、网络重组和 walreceiver 缓冲流程见 [DCF 模式下 XLog Entry 的切分、传输与落盘流程](dcf-xlog-transport-flow.md)。
 
-当前已知现象包括：
+## 当前结论摘要
 
-- CRC 失败是偶现的，暂时没有稳定的业务触发条件；
-- 第一次 core 后，接收端重启可能持续 core；
-- 两个备机可能对同一个 XLog 位置同时失败；
-- 出错时解析出的 `xl_tot_len` 可能超过 10000；
-- 出错版本中 record body 看起来基本正常，但保存、跨页拼接出来的固定 `XLogRecord` header 值可疑；
-- 私有 DCF 代码中还存在 entry checksum 不一致的日志，但当前逻辑只打印，没有阻止发送。
+### 接收端
 
-## 当前结论
+- 当前 core 已经证明：checker 把真实 WAL record body 中的 `E3/B90D4698` 当成了下一条 `WalRecord` header。
+- 从该位置读出的 `xl_tot_len = 0x3c989677 = 1016632951` 是 fake header 字段，不是真实 record 长度。
+- `ready_data_len` 最终也达到 `1016632951`，说明状态机确实从错误 record 边界持续累计了约 1 GiB，最后才执行 CRC 并 PANIC。
+- 测试会 kill 备机。重启后 CRC 线程状态全部初始化，同时 DCF applied/index 发生回退，主机重发一段旧 WAL。重发字节可以完全正确，但第一次校验起点未必是 WAL record 起点。
+- 非 TDE 路径原本依靠 `is_first_check`：第一次从非 record 边界解析得到 CRC mismatch 后跳到下一 WAL page，再通过 page header 和 `XLP_FIRST_IS_CONTRECORD` 找回可信 record 边界。
+- 当前 TDE 分支会在 fake header 恰好满足 `IS_RECORD_ENCRYPTED()` 时跳过 CRC mismatch；`latest_end_ptr` 已经提前更新且没有回退，`is_first_check` 又被清除，于是错误边界继续传播。
+- 直接故障原因已经确定；“首次 fake encrypted record 绕过恢复逻辑”是当前概率最高的上游原因，但仍需捕获第一次污染现场才能达到完全闭环。
 
-- `xl_tot_len` 超过 10000 本身正常。它表示整个逻辑 WAL record 的长度，不是固定 record header 的长度；单条 record 可以跨多个 8 KiB WAL page。
-- 一个 DCF entry/index 对应一次 `dcf_write()` 的连续物理 WAL 区间，不对应一条 WAL record。一个 entry 可以包含多条 record，一条 record 也可以跨多个 entry。
-- 两个备机在同一个 record LSN 上失败，说明问题具有确定性；它降低了节点私有线程状态、随机内存残留和偶发竞争的概率，但仍然无法单独区分：
-  - leader 重建出同一份错误 WAL，并发给两个备机；
-  - 两个备机使用相同的校验状态机，对同一种合法 WAL 布局产生相同误判。
-- 重启后持续 core 不能单独证明 WAL 已损坏。DCF 只有在 apply 回调成功返回后才推进 applied index；回调内部 core 会让相同 DCF index 在重启后再次投递，形成稳定的“毒 entry 重放”。
-- 如果备机原生 redo 已经正常越过失败 record，并且 `XLogReader` 没有报告 CRC 错误，则物理 WAL 基本可信，应优先定位自定义 checker。
-- 如果 DCF entry checksum 的保存值确实来自原始 `dcf_write()` payload，而回读值来自最终拼装的完整 WAL payload，那么 checksum 不一致说明 header-only body 重建路径已经改变了字节；但必须先确认两次 checksum 使用了完全相同的 `buf/len` 语义。
+### 发送端
 
-## 四个观测点
+- 一个 DCF entry 是一段连续物理 WAL，不是一条 WAL record。一个 entry 可以包含多条 record，一条 record 也可以跨多个 entry。
+- 单个 entry 不超过约 1 MiB 不构成额外适配要求；`check_xlog_buf()`本身能够跨调用保存 fixed header、record body、page header 和 CRC 中间态。
+- 同一 node 的连续磁盘 entry 可以跨 entry 校验；中间存在 cache hit、回退、重传或 index 跳变时，`startPtr != check_end_ptr`，checker 应完整 clean 后重新同步。
+- 发送端只校验磁盘 entry 会降低覆盖率，但符合当前目标。未能确认 record 边界时应跳过，不能报 CRC 失败。
+- 接收端发现的 `is_first_check`/TDE 缺陷同样影响发送端。统一修复后，不需要为 1 MiB entry 重新实现一套 WAL parser。
 
-把一段相同的物理 WAL 区间记为 `[start_lsn, end_lsn)`，沿链路建立四个观测点：
+## 三种边界必须分开
 
-```text
-A. openGauss 调用 dcf_write() 前
-   原始 buf / nBytes / end LSN / physical hash
-
-B. DCF leader cache miss 后
-   从本地 WAL 文件重建出的 send_buf / send_len / end LSN / physical hash
-
-C. DCF follower ReceiveLogCbFunc()
-   ENTRY_BUF / ENTRY_SIZE / key / physical hash
-
-D. walreceiverwriter / 原生 XLogReader
-   实际写盘字节 / 自定义 record CRC / 原生 record CRC
-```
-
-这里需要区分两类 checksum：
-
-- entry physical hash/checksum：对完整物理 WAL 区间逐字节计算，包含 WAL page header 和 padding，不要求 record 对齐；
-- WAL record CRC：对一条逻辑 record 计算，排除物理 WAL page header、对齐 padding 和 `xl_crc` 字段自身，计算顺序为 record data 在前、固定 header 在后。
-
-entry checksum 更适合判断“字节在哪一层发生变化”，record CRC 更适合判断“逻辑 WAL record 是否有效”。
-
-## 为什么重启后会持续 core
-
-DCF follower apply 的关键顺序是：
-
-```text
-rep_apply_proc(index N)
-  → stg_get_entry(index N)
-  → ReceiveLogCbFunc(...)
-      → XLogWalRcvReceive(...)
-          → walRcvWrite(...)
-              → 自定义 CRC 校验
-                  → core
-  → 回调成功返回后才 stg_set_applied_index(index N)
-```
-
-如果 core 发生在 `walRcvWrite()` 的校验路径中：
-
-- `ReceiveLogCbFunc()` 无法正常返回；
-- `DcfUpdateAppliedRecordIndex()` 也可能尚未执行；
-- DCF 的 applied index 不会推进；
-- 重启后仍然从同一个 index 开始 apply；
-- 相同的真实坏字节或相同的确定性 checker bug 会再次 core。
-
-因此，持续 core 主要排除了“旧进程 TLS 中间态残留”，但不能区分真实坏 WAL 与确定性误校验。
-
-比较连续两次 core 时，先看：
-
-```text
-DCF index
-entry start/end LSN
-record start LSN
-xl_tot_len
-stored xl_crc
-calculated crc
-```
-
-- 所有字段完全相同：同一个毒 entry/record 的确定性问题；
-- stored CRC 相同，但 calculated CRC 每次不同：未初始化内存、状态未完整清理、buffer 生命周期或并发覆盖更可疑；
-- 每次失败 LSN 不同，但布局特征相同：可能是一类 page/segment/continuation 边界没有适配。
-
-## 最小诊断方案
-
-第一轮不要打印所有 page 和 record，只增加三组信息。
-
-### 1. DCF entry 级别
-
-```text
-thread_id
-stream_id
-node_id
-index
-entry_type
-source = cache / disk
-entry_start_lsn
-entry_end_lsn
-original_len
-rebuilt_len
-stored_entry_checksum
-rebuilt_entry_checksum
-cross_page
-cross_segment
-```
-
-已经确认只对 `ENTRY_TYPE_LOG` 调用 WAL CRC 后，`ENTRY_TYPE_CONF` 不应进入校验器，也不应因为它占用了一个 DCF index 就清理 WAL CRC 状态。
-
-### 2. checker 输入和 reset
-
-```text
-input_start_lsn
-input_end_lsn
-nbytes
-previous_expected_lsn
-是否发生 discontinuity reset
-reset 原因：gap / overlap / retry / rewind / epoch change
-当前状态：header / data / continuation / padding / resync
-```
-
-发送端只在 disk miss 时校验，意味着 checker 看到的不是完整发送流。cache hit entry 会被跳过，因此下一个 disk entry 到达时很可能与旧 `expected_lsn` 不连续。此时必须完整 reset，并从可信 WAL page 边界重新同步。
-
-### 3. CRC 首次失败
-
-```text
-record_start_lsn
-record_start_lsn % XLOG_BLCKSZ
-xl_tot_len
-xl_term
-xl_xid
-xl_prev
-xl_info
-xl_rmid
-xl_bucket_id
-stored_xl_crc
-calculated_crc
-fixed_header_bytes_saved
-logical_record_bytes_saved
-涉及的最近几个 DCF index
-```
-
-仅凭 `xl_tot_len = 10000+` 不能判断 header 错误。更有效的 header 合法性检查是：
-
-- `SizeOfXLogRecord <= xl_tot_len < XLogRecordMaxSize`；
-- `xl_rmid <= RM_MAX_ID`；
-- 顺序读取时 `xl_prev` 等于上一条 record 的起点；
-- 随机接入时至少满足 `xl_prev < record_start_lsn`；
-- record 起点不是 WAL page header 或 alignment padding。
-
-## 用小型循环缓冲代替大量日志
-
-偶现问题不适合长期打印每个 record。可以在线程局部状态中保存最近 4 到 8 个事件，CRC 失败时一次性输出，或者直接从 core 中读取。
-
-示意结构：
-
-```c
-#define CRC_DEBUG_HISTORY_SIZE 8
-
-typedef struct CrcDebugItem {
-    uint64 index;
-    XLogRecPtr input_start;
-    XLogRecPtr input_end;
-    XLogRecPtr record_start;
-    uint32 input_len;
-    uint32 xl_tot_len;
-    uint32 fixed_header_saved;
-    uint32 logical_record_saved;
-    uint32 stored_crc;
-    uint32 calculated_crc;
-    bool from_disk;
-    bool reset;
-} CrcDebugItem;
-
-THR_LOCAL volatile CrcDebugItem g_crc_debug_history[CRC_DEBUG_HISTORY_SIZE];
-THR_LOCAL volatile uint32 g_crc_debug_pos;
-```
-
-`volatile` 主要是为了降低调试变量被编译器完全优化掉的概率，不用于线程同步。每个 append/receiver 线程仍然维护自己的槽。
-
-还可以固定保存少量现场字节：
-
-```c
-THR_LOCAL volatile char g_failed_header[SizeOfXLogRecord];
-THR_LOCAL volatile char g_failed_first_bytes[64];
-THR_LOCAL volatile char g_failed_last_bytes[64];
-```
-
-不要默认 dump 完整 record。record 最大可以接近 1 GiB，优先保存固定 header、首尾字节和逐 page hash；只有在受控测试环境中才保存完整 record 或相关 WAL segment。
-
-## 利用 core 文件定位
-
-### core 能提供什么
-
-如果 CRC 不一致后直接 `Assert`、`abort` 或 `PANIC`，core 通常可以保留：
-
-- 当前调用栈和崩溃行；
-- 当前校验函数的参数；
-- TLS、全局变量和仍然存活的 heap buffer；
-- 保存的残留 header；
-- 当前 record 累计状态；
-- 当前 `buf/nbytes/start LSN`，前提是对应内存页被 core 收录。
-
-core 不是执行历史，不能自动恢复已经处理、释放或覆盖的前几个 record。要观察历史，需要上面的循环诊断缓冲。
-
-### 使用条件
-
-- core 对应的 `gaussdb` 二进制必须完全匹配；
-- 保留匹配的 debug symbol；
-- 二进制不要 strip，最好使用 `-g`；
-- 高优化构建可能出现局部变量 `<optimized out>`；
-- 共享内存是否进入 core 取决于操作系统和 core dump 配置，因此关键字节最好额外复制到 TLS 诊断结构。
-
-### 基本 GDB 操作
-
-```gdb
-gdb /path/to/gaussdb /path/to/core
-
-thread apply all bt full
-thread <walreceiverwriter-thread-number>
-frame <crc-check-frame-number>
-info args
-info locals
-```
-
-检查状态：
-
-```gdb
-p record_start_lsn
-p saved_header_len
-p logical_record_bytes_saved
-p expected_lsn
-p stored_crc
-p calculated_crc
-p g_crc_debug_history
-
-x/32bx saved_header_buf
-x/64bx current_buf
-```
-
-如果完整逻辑 record buffer 仍然存在，可以从 core 导出：
-
-```gdb
-dump binary memory /tmp/failed-record.bin \
-    record_buf \
-    record_buf + record_total_len
-```
-
-如果 core 只能看到固定 header，也已经足够检查 `xl_tot_len/xl_prev/xl_rmid/xl_crc` 是否来自正确的 record 起点。
-
-## 固定 XLogRecord header 跨页检查
-
-openGauss 插入 WAL 时只保证 record 起始页至少能放下前四字节 `xl_tot_len`：
-
-```c
-Assert(freespace >= sizeof(uint32));
-```
-
-它不保证整个固定 `XLogRecord` header 都在同一页。因此合法布局可以是：
-
-```text
-record start page 尾部:
-  [xl_tot_len][固定header的前半部分]
-
-next WAL page:
-  [short/long page header]
-  [固定XLogRecord header剩余部分]
-  [record body]
-```
-
-这个保证只针对物理 WAL page。任意 DCF entry、walreceiver ring 或 `walRcvWrite()` 输入边界仍然可以把 `xl_tot_len` 的四个字节拆成两次调用。此时应该暂存不足四字节的输入；下一次输入如果仍位于同一物理 page，就直接继续拼接，不能因为“换了一个 buf”就跳过 page header。
-
-用下面的条件快速识别固定 header 跨页：
-
-```c
-uint32 page_remain = XLOG_BLCKSZ - record_start_lsn % XLOG_BLCKSZ;
-
-page_remain >= sizeof(uint32) &&
-page_remain < SizeOfXLogRecord
-```
-
-如果故障 record 都满足这个条件，优先检查保存 header 的逻辑是否把下一页的物理 page header 错当成了 record header。
-
-正确的物理拼接模型是：
-
-```text
-第一页复制 page_remain 个 record 字节
-到达物理 page boundary
-解析并跳过 short/long WAL page header
-再复制 SizeOfXLogRecord - page_remain 个 record header 字节
-```
-
-下一页使用 long 还是 short header 取决于物理 LSN：
-
-```c
-page_lsn % XLogSegSize == 0
-    ? SizeOfXLogLongPHD
-    : SizeOfXLogShortPHD
-```
-
-必须区分：
-
-```text
-新的回调/buf 开始
-    不一定有 WAL page header
-
-physical_lsn % XLOG_BLCKSZ == 0
-    才表示进入新的物理 WAL page
-```
-
-另一个常见错误是用：
-
-```text
-record_end_lsn = record_start_lsn + xl_tot_len
-```
-
-这只在 record 没有跨物理 WAL page 时成立。`xl_tot_len` 不包含中间插入的 short/long page header，跨页时必须按逻辑字节计数并单独推进物理 LSN。
-
-建议分别维护：
-
-```text
-fixed_header_bytes_saved
-logical_record_bytes_saved
-current_physical_lsn
-expected_input_lsn
-```
-
-不要使用一个“残留 record 长度”同时表达固定 header 已保存长度、整个逻辑 record 已保存长度和物理 LSN 推进量。
-
-## continuation 和重同步检查
-
-在物理 WAL page 起点需要先解析 page header：
-
-```text
-xlp_magic
-xlp_info
-xlp_pageaddr
-xlp_rem_len
-```
-
-如果设置 `XLP_FIRST_IS_CONTRECORD`：
-
-- page header 后首先是上一条 record 的 continuation；
-- continuation 没有新的 `xl_tot_len`；
-- `xlp_rem_len` 表示从本页开始仍然剩余的逻辑 record 字节数；
-- continuation 跨下一页时，需要继续跳过下一页 page header；
-- continuation 结束后，还需要处理 `MAXALIGN` padding，才能到达下一条可信 record 起点。
-
-状态 reset 后如果输入从 page 中间开始，当前字节可能是：
-
-- record header；
-- record body；
-- alignment padding。
-
-仅凭字节内容无法可靠判断。安全策略是放弃当前 page 剩余部分，从下一个可验证的 page header 开始重新同步。这样可能少校验一条 record，但不会把 body 中的四个字节误当成 `xl_tot_len`。
-
-## `original_wal_len` 的来源
-
-### 开源标准路径
-
-标准 openGauss/DCF 中，`original_wal_len` 不是新增推导值，它就是 `XLogWritePaxos()` 传给 `dcf_write()` 的 `nBytes`。长度沿调用链原样传递：
-
-```text
-XLogWritePaxos
-  nBytes
-    ↓
-dcf_write(buffer, length = nBytes, key = WriteLSN)
-    ↓
-rep_write(buffer, length, key)
-    ↓
-stg_append_entry(..., size = length, key)
-    ↓
-stream_append_entry(..., size)
-    ↓
-IO_BUF_SIZE(entry) = size
-    ↓
-ENTRY_SIZE(entry) = original_wal_len
-```
-
-同时：
-
-```c
-WriteLSN = LogwrtPaxos->Write + nBytes;
-dcf_write(1, from, nBytes, WriteLSN, &paxosIdx);
-```
-
-因此标准完整 payload 版本满足：
-
-```text
-original_wal_len = nBytes = ENTRY_SIZE(entry)
-entry_end_lsn    = ENTRY_KEY(entry) = WriteLSN
-entry_start_lsn  = entry_end_lsn - original_wal_len
-```
-
-### 私有 header-only 路径
-
-header-only 优化后必须区分：
-
-```text
-original_wal_len：最初 dcf_write() 的 WAL payload 长度
-stored_reference_len：DCF segment 文件中实际保存的引用 header 长度
-assembled_send_len：发送前从本地 WAL 重建出的最终 payload 长度
-```
-
-正确关系应当是：
-
-```text
-original_wal_len == assembled_send_len
-stored_reference_len 可以更小
-```
-
-私有实现可能采用以下任一种方式保存 `original_wal_len`：
-
-- 保留 `IO_BUF_SIZE/ENTRY_SIZE` 的原始逻辑语义，只让 segment 物理存储长度使用另一个字段；
-- 在自定义引用 header 中增加 `original_size/wal_len`；
-- 同时保存 start/end LSN，通过 `end_lsn - start_lsn` 恢复长度；
-- 根据相邻 entry key 推导 start LSN，但这种方式对截断、缺 entry 和配置 entry 更敏感。
-
-不能仅凭字段名判断。核对非公开版本时，应从最初的 `dcf_write(length)` 开始，逐层跟踪：
-
-```text
-dcf_write.length
-  → rep_write.length
-  → stream_append_entry.size
-  → 持久化引用header中的长度字段
-  → segment_get_entry读取时的物理分配长度
-  → body重建使用的WAL长度
-  → stg_get_entry返回后的ENTRY_SIZE
-  → rep_encode_one_log/mec_put_bin最终发送长度
-  → 内核CRC回调长度
-```
-
-对同一个 `index/key`，建议临时打印上述关键阶段的长度。内核 CRC 回调必须使用与最终 `mec_put_bin()` 完全相同的 WAL `buf/len`，而不是 DCF segment 的物理存储长度。
-
-## 为什么标准 DCF entry 不拆开四字节 `xl_tot_len`
-
-这个结论依赖当前标准 `XLogWritePaxos()` 的全部截断来源，而不只是 1 MiB 上限。
-
-每轮先计算：
-
-```c
-WriteTotal = PaxosWriteRqst - LogwrtPaxos->Write;
-
-CriticalNBytes =
-    从当前WAL cache位置到cache数组末尾的连续物理字节数;
-
-nBytes = Min(WriteTotal,
-             Min(MaxSendSizeBytes, CriticalNBytes));
-```
-
-`nBytes` 的实际限制来源有三种：
-
-| 限制来源 | 当前代码中的 entry end | 是否可能拆四字节 `xl_tot_len` |
+| 边界 | 含义 | 是否保证是 record 边界 |
 | --- | --- | --- |
-| `WriteTotal` 最小 | `PaxosWriteRqst` | 当前两个调用点传入完整 WAL copy status 的 `endLSN`，或者大 record copy 到达的物理 page boundary |
-| `MaxSendSizeBytes` 最小 | 显式减去 `tmpLsn % XLOG_BLCKSZ`，回退到物理 page boundary | 不会；record 起始页保证至少容纳四字节 |
-| `CriticalNBytes` 最小 | WAL cache 数组末尾；根据公式，物理 LSN offset 回到 page boundary | 不会；同样落在物理 page boundary |
+| WAL record boundary | 一条逻辑 record 的起止位置 | 是 |
+| WAL page boundary | 8 KiB 物理 page 起点，先出现 short/long page header | 否；page 后可能是上一条 record continuation |
+| DCF entry/index boundary | 一次 `dcf_write()` 的连续 WAL payload | 否；可以包含多条 record 或截断 record body |
+| walreceiverwriter `buf/nbytes` boundary | 环形缓冲当前连续可读区间 | 否；可能合并或拆开 DCF entry |
 
-当前两个 `XLogWritePaxos()` 调用来源是：
-
-1. WAL background flush 使用 `curr_entry_ptr->endLSN`。它是已经完成 WAL copy 的状态项末尾，不是任意输入 buffer 位置；
-2. `XLogSelfFlushWithoutStatus()` 在复制超大 record、WAL buffer 环回时传入 `currPos`。调用发生前已把当前 page 的 `freespace` 全部复制完，因此 `currPos` 位于物理 WAL page boundary。
-
-WAL insert 端同时保证：
-
-```c
-Assert(freespace >= sizeof(uint32));
-```
-
-也就是一条新 record 开始时，其起始 page 一定可以完整放下四字节 `xl_tot_len`。于是标准 entry end 只有两类可信位置：
-
-```text
-完整record/copy-status末尾
-物理WAL page boundary
-```
-
-前者不会截断 record；后者即使截断固定 `XLogRecord` header，也已经包含完整的四字节 `xl_tot_len`。所以标准路径下：
-
-```text
-xl_tot_len四字节不会跨两个DCF entry
-固定XLogRecord header的剩余部分仍可能跨两个DCF entry
-record body可以跨多个DCF entry
-```
+`check_end_ptr == startPtr` 只证明两次输入的物理 LSN 连续，不证明 `startPtr` 是 record boundary。
 
 例如：
 
 ```text
-entry N尾部，同时也是page尾部:
-  [完整xl_tot_len][固定header前半部分]
+entry N:
+  record A 前半部分
+  check_end_ptr = X
 
 entry N+1:
-  [short/long page header]
-  [固定header剩余部分]
-  [record body]
+  startPtr = X
+  record A 后半部分
 ```
 
-这项保证只适用于“一个回调输入等于一个完整原始 DCF entry”的发送端。它不适用于：
+此时 `startPtr == check_end_ptr` 完全正常。上一轮应保留 `is_remaining_xlog=true`、`latest_wal_record` 和 `ready_data_len`，下一轮继续走 `check_from_middle()`。
 
-- walreceiver ring/walRcvWrite 的任意连续区间；
-- MEC fragment；
-- body 重建过程中的单次 `pread`；
-- 私有代码新增的任意字节限流或重新切片。
-
-发送端内核回调如果放在 `stg_get_entry()` 完成全部 body 拼装之后、`rep_encode_one_log()` 之前，并且一次传入完整 `ENTRY_BUF/ENTRY_SIZE`，才可以使用这项 entry 边界保证。
-
-### 非公开版本核对清单
-
-在非公开版本中需要重新确认：
-
-1. `XLogWritePaxos()` 的 `nBytes` 是否仍然只取 `WriteTotal/MaxSendSizeBytes/CriticalNBytes` 三者最小值；
-2. 命中任意发送大小上限时，是否仍然回退到 `XLOG_BLCKSZ` page boundary；
-3. 所有 `XLogWritePaxos()` 调用点传入的是 record/copy-status end，还是新增了任意 LSN；
-4. `dcf_write()` 是否仍然一次调用创建一个 index，内部有没有按更小大小重新切 entry；
-5. header-only 持久化是否保留 `original_wal_len`，有没有把它替换成引用 header 长度；
-6. `stg_get_entry()` 返回前是否已经拼出完整原始 WAL payload；
-7. 内核 CRC 回调是一整个 assembled entry 调用一次，还是每个 `pread`/拼装片段调用一次；
-8. `rep_encode_one_log()` 最终发送的 `buf/len/key` 是否与内核 CRC 回调完全相同。
-
-只要其中一项发生变化，就不能继续假设 `xl_tot_len` 不会跨发送端回调边界。
-
-## header-only DCF 优化检查
-
-私有实现如果只持久化引用 header，发送时从本地 WAL 文件拼 body，应同时维护两组长度：
+真正异常的组合是：
 
 ```text
-stored_reference_len
-original_wal_len
+startPtr == check_end_ptr
+is_remaining_xlog == false
+startPtr 又位于 record body
 ```
 
-CRC 回调必须使用最终发送的三元组：
+在状态机正确的前提下，这种组合不应自然出现；它通常意味着状态已经被错误推进、保存/恢复不完整，或者相同 LSN 的输入语义发生了变化。
+
+## `check_xlog_buf()` 的状态模型
+
+至少需要同时保存：
 
 ```text
-send_buf
-send_len = original_wal_len
-end_lsn = original entry key
+latest_comp_crc
+latest_check_ptr
+latest_end_ptr
+check_end_ptr
+latest_wal_record_valid_size
+latest_wal_record
+is_remaining_xlog
+ready_data_len
+is_remain_page_header
+page_header_info
+page_header_rem_len
+is_first_check
 ```
 
-并满足：
+连续输入时，这些字段共同描述当前 record/header/page continuation 的解析进度。发生 gap、overlap、rewind 或 checker 初始化时，不能只清一两个长度字段，必须把整组状态恢复到一致的初始值。
+
+初始化或 clean 后的关键状态是：
 
 ```text
-start_lsn = end_lsn - send_len
+check_end_ptr     = INVALID
+latest_end_ptr    = INVALID
+is_remaining_xlog = false
+is_first_check    = true
+ready_data_len    = 0
+header/CRC buffer = empty
 ```
 
-不能使用：
+如果 `check_xlog_buf()` 入口发现：
 
-- DCF 引用 header 长度；
-- DCF 磁盘实际落盘长度；
-- 临时 buffer 容量；
-- 只读取到当前 WAL segment 末尾的长度。
+```cpp
+startPtr != check_end_ptr
+```
 
-即使长度正确，body 仍可能错误。磁盘恢复路径还要检查：
+当前实现会 clean，然后继续处理本次 `buf`。如果 `startPtr` 位于 page 中间，`check_from_start()` 无法仅凭字节内容判断当前位置是 record header、record body 还是 padding，只能依靠首次失败后的 resync 机制恢复。
 
-1. entry 是否跨 `XLogSegSize`，跨文件时是否逐段读取；
-2. 每次 `pread` 的请求长度和实际返回长度是否完全相同；
-3. 是否使用正确 timeline、segment 编号和 segment 内 offset；
-4. 本地 WAL write/flush LSN 是否已经覆盖 `entry_end_lsn`；
-5. 被引用的 WAL segment 是否已被 recycle 或复用；
-6. 临时拼装 buffer 是否全部覆盖，尾部是否残留旧数据；
-7. CRC/checksum 校验失败后是否仍继续调用 `rep_encode_one_log()`。
+## 接收端故障证据
 
-标准 openGauss 路径先执行 `XLogWritePaxos()`，再执行本地 `XLogFlushCore()`。header-only 优化必须额外保证：DCF cache 中 body 被回收、需要从 `pg_xlog` 回读时，对应物理 WAL 已经可以安全读取。
+### 真实 WAL 布局
 
-## DCF checksum 如何使用
-
-开源 DCF 创建 entry 时会对完整 payload 计算 `ENTRY_DATA_CHKSUM`。标准磁盘读取路径在 checksum 不一致时把 entry 标记为无效，而不是继续发送。
-
-私有 header-only 实现如果只打印不一致，需要先确认：
+原生 XLog 信息为：
 
 ```text
-stored checksum 的计算 buf/len
-rebuilt checksum 的计算 buf/len
-checksum 是否在剥离 body 前后被重新计算
-ENTRY_SIZE 在两次计算中的语义
+REDO @ E3/B90D31E0
+LSN  E3/B90D4EB0
+total 7350
+UHeap - uheap_new_page
+this xlog has been encrypted
 ```
 
-只有下面条件全部成立时，DCF checksum mismatch 才能直接证明 body 发生变化：
+物理布局可以还原为：
 
 ```text
-stored_checksum = checksum(original dcf_write payload, original_nbytes)
-rebuilt_checksum = checksum(final send payload, final_send_len)
-original_nbytes == final_send_len
+E3/B90D31E0  record start
+      |
+      | 3616 bytes record data
+      v
+E3/B90D4000  WAL page boundary
+      |
+      | 24 bytes short page header
+      v
+E3/B90D4018  record continuation
+      |
+      | record 后半部分
+      v
+E3/B90D4EB0  aligned next position
 ```
 
-发生 mismatch 后应优先停止当前 entry 的发送并保持 `NEXT_INDEX` 不推进。可以重新读取并重试；持续失败时应升级为缺日志、重建或明确故障，不能把已知不一致的 payload 继续传播给备机。
+`E3/B90D4698` 位于 `[E3/B90D4018, E3/B90D4EB0)` 内，距离 continuation 起点 `0x680 = 1664` 字节，因此绝不是 record boundary。
+
+### Core 与 PANIC
+
+PANIC 位置：
+
+```text
+incorrect wal record in E3/B90D4698
+wal total len 1016632951
+```
+
+core 中保存的 fake header：
+
+```text
+xl_tot_len = 0x3c989677 = 1016632951
+ready_data_len = 1016632951
+latest_check_ptr = E3/B90D4698
+latest_end_ptr ≈ E3/F5D37568
+is_remaining_xlog = true
+is_first_check = false
+```
+
+这组值互相吻合：checker 从 `E3/B90D4698` 的普通 payload 字节中读出约 1 GiB 的 fake `xl_tot_len`，随后跨大量 page 和输入批次累计数据；物理 page header 不计入 `ready_data_len`，因此最终物理结束位置还包含额外 page-header 开销。
+
+当前 core 是第二条 fake record 的最终现场，无法恢复更早第一次把 `latest_check_ptr` 推到 `E3/B90D4698` 时的 header 字节。
+
+## 接收端最可能触发链
+
+测试过程提供了重要前置条件：
+
+```text
+kill 备机
+  → walreceiverwriter/CRC TLS 状态全部重置
+  → 备机重启
+  → DCF index/applied 状态回退
+  → 主机重发一段旧 WAL
+```
+
+第一次进入 checker 时 `check_end_ptr=INVALID`，因此不会产生 `startPtr != check_end_ptr` 的 clean 日志，而是直接使用 `is_first_check=true` 处理重发起点。
+
+当前最可能存在两条 fake record：
+
+```text
+fake record A
+  重发起点不在 record boundary
+    ↓
+  body/padding 被解释成 WalRecord header
+    ↓
+  fake header 恰好满足 IS_RECORD_ENCRYPTED
+    ↓
+  CRC mismatch 被 TDE 条件静默跳过
+    ↓
+  latest_end_ptr 已更新且不回退
+    ↓
+  is_first_check 被置为 false
+    ↓
+  下一位置被推进到 E3/B90D4698
+
+fake record B
+  从 E3/B90D4698 读取 header
+    ↓
+  xl_tot_len = 0x3c989677
+    ↓
+  累计约 1 GiB
+    ↓
+  当前 fake header 未命中 encrypted
+    ↓
+  CRC mismatch + is_first_check=false
+    ↓
+  PANIC
+```
+
+这可以同时解释：
+
+- 为什么问题偶现：非对齐字节还要恰好命中 fake encrypted 条件；
+- 为什么第一次 core 后可能持续 core：每次重启都从相同 DCF entry/LSN 和相同字节重新开始，判断结果是确定性的；
+- 为什么两个备机可能在同一个位置 core：两边经历相同的 reset、回退和重发起点；
+- 为什么原生 WAL record 看起来正常：真正错误的是 checker 识别出的 record boundary，而不是必然存在物理 WAL 损坏。
+
+## 接收端修复原则
+
+### 首次恢复优先于 TDE 例外
+
+当前危险逻辑等价于：
+
+```text
+encrypted && CRC match      → 特殊处理
+!encrypted && CRC mismatch  → first-check resync / PANIC
+encrypted && CRC mismatch   → 静默成功
+```
+
+首次或失步状态下，`WalRecord` header 尚未可信，不能先信任从该 header 读取的 `IS_RECORD_ENCRYPTED()`。
+
+正确优先级应为：
+
+```text
+CRC mismatch
+  if is_first_check / unsynced
+      无论 encrypted 位是什么，都执行 page resync
+  else if 已确认是真实 encrypted record
+      使用 TDE 的特殊语义
+  else
+      retry / PANIC
+```
+
+修复时还应满足：
+
+1. CRC 和结构校验成功前，只计算 `candidate_end_ptr`，不要提前提交 `latest_end_ptr`；
+2. first-check 失败后清理 fake record 的 header、`ready_data_len` 和 CRC 中间态；
+3. `is_first_check` 保持 true，直到 page/CONTRECORD resync 完成或第一条可信 record 验证成功；
+4. 跳到下一物理 page 后先处理 short/long page header；
+5. `XLP_FIRST_IS_CONTRECORD` 置位时按 `xlp_rem_len` 跳过 continuation 和 alignment padding，再开始下一条 record。
+
+## 发送端接入结论
+
+### 调用位置
+
+发送端回调位于 `rep_appendlog_node()` 的 index 循环内：
+
+```text
+stg_get_entry(stream_id, index)
+  → 私有版本完成 header-only WAL body 拼装
+  → 对 ENTRY_TYPE_LOG 调用内核 check_xlog_buf()
+  → rep_encode_one_log()
+  → mec_send_data()
+```
+
+一次 AppendLog RPC 可以包含多个 entry，但回调仍按 entry 逐个执行。回调参数必须与最终发送数据一致：
+
+```text
+buf       = assembled ENTRY_BUF(entry)
+len       = assembled/original WAL length
+end_lsn   = ENTRY_KEY(entry)
+start_lsn = end_lsn - len
+```
+
+不能用 header-only 引用 header 的物理存储长度计算 `start_lsn`。
+
+### 线程和 node 状态
+
+开源 DCF 使用 `g_append_thread_id[node_id]` 将同一 follower 固定到一个 append 线程。一个线程仍可能轮询多个 node，因此私有内核回调需要按目标 `node_id` 保存/切换完整 CRC 状态槽。
+
+切换时必须保存前述全部状态，包括：
+
+```text
+latest_wal_record 字节
+latest_wal_record_valid_size
+ready_data_len
+page-header partial state
+is_remaining_xlog
+is_first_check
+check_end_ptr/latest_* ptr
+CRC 中间态
+```
+
+只保存 LSN 和 CRC 数值、不保存 partial header/body，会在 node 切回时制造新的 fake record。
+
+### 只校验磁盘 entry
+
+当前目标允许跳过 cache hit entry，因此输入分为：
+
+```text
+连续磁盘 entry
+  → startPtr == check_end_ptr
+  → 保留中间态，允许一条 record 跨多个 entry
+
+中间存在 cache hit entry
+  → 下一个磁盘 entry 的 startPtr != check_end_ptr
+  → clean
+  → is_first_check=true
+  → 从当前输入重新同步
+  → 中间 record 可以漏检，但不能误报
+```
+
+一个 entry 小于约 1 MiB 不影响 parser 正确性：
+
+- 一个 entry 可以包含多条完整 record；
+- entry 可以以某条 record body 开始或结束；
+- 一条大 record 可以跨多个 entry；
+- fixed header 或 page header 也可以跨 checker 调用。
+
+因此，统一修复 `is_first_check`/TDE 优先级后，`check_xlog_buf()`可以直接复用于发送端，无需按 1 MiB entry 重新实现 parser。代价只是磁盘 entry 之间存在空洞时覆盖率下降。
+
+### 发送端 best-effort 判错条件
+
+只有下面条件全部成立时，发送端才应该上报 CRC mismatch：
+
+```text
+1. 当前已经找到可信 record boundary；
+2. header 已完整拼接并通过基本结构检查；
+3. 本条 record 的字节来自连续的已校验 entry；
+4. record body 已完整收齐；
+5. 当前不是 unsynced/first-check 恢复阶段；
+6. TDE record 使用了正确的可校验语义；
+7. stored CRC 与 calculated CRC 仍不一致。
+```
+
+任何条件不满足时，应丢弃未完成状态并重新同步，而不是 PANIC。这个策略符合“允许漏校验，但不允许误校验失败”的目标。
+
+## `wal_total_len` 为 0 或过小
+
+合法 record 的 `wal_total_len/xl_tot_len` 不可能小于对应 fixed header。下面的写法存在无符号下溢风险：
+
+```cpp
+wal_total_len - SIZE_OF_WAL_RECORD
+```
+
+当 `wal_total_len=0` 时，结果会变成一个很大的无符号数，随后 CRC、拷贝或长度累计可能越界并 core。ARM 可能更容易暴露，但根因与架构无关。
+
+必须在任何减法和 CRC feed 之前检查：
+
+```cpp
+if (!header_complete) {
+    /* 继续收集header，不能读取长度之外的字段 */
+}
+
+uint32 header_size = is_new_record
+    ? SIZE_OF_WAL_RECORD(WalRecord)
+    : SIZE_OF_WAL_RECORD(OWalRecord);
+
+if (wal_total_len < header_size ||
+    wal_total_len > WAL_RECORD_MAX_SIZE) {
+    /* 禁止继续减法、拷贝和CRC */
+}
+```
+
+处理方式按同步状态区分：
+
+```text
+is_first_check=true / unsynced
+  → 认为当前 header 不可信
+  → 清理当前 fake record
+  → 跳到下一 WAL page
+  → 不报 CRC 错误
+
+已经处于可信 record 流
+  → 可能是真实 WAL/header 损坏
+  → 重新读取确认，或按严格策略报错
+```
+
+发送端 best-effort 模式可以选择 reset + 跳页。判断非法后不能只增加 `offset`，必须同步清理 `latest_wal_record_valid_size`、`ready_data_len`、`is_remaining_xlog` 和 CRC 中间态。
+
+仅增加上限检查无法捕获当前约 1 GiB fake record，因为垃圾长度可能仍落在 `WAL_RECORD_MAX_SIZE` 范围内。根本保护仍然是：unsynced 时不信任 header，并修复 TDE 绕过。
+
+## 全零 header 与并发清理
+
+发送端曾出现大量 `wal_total_len=0`，随后在 header 校验位置 core，日志中的待校验 header 字段全部为 0。可能来源包括：
+
+1. parser 从空白/padding/已清理 buffer 中读取；
+2. clean/reset 与 `check_xlog_buf()` 并发，校验线程正在读取时另一线程 `memset` CRC context；
+3. 私有 DCF truncate/header-only 重建路径把无效 entry 或未填满 buffer 继续交给回调；
+4. core 观察到的是 clean 后的 buffer，而不是第一次异常读取时的历史内容。
+
+如果 clean 只由当前 append 线程在 `check_xlog_buf()` 内执行，不需要额外锁。只有 truncate/reset 等其他线程能够修改共享 node slot 或当前校验 buffer 时，才存在并发问题。
+
+仅给 `memset` 一侧加锁没有意义。要么：
+
+- 同一个 node 的 `load context → check_xlog_buf → save context` 全过程与 truncate clean 使用同一把锁；
+- 更推荐由 truncate 线程只设置 `reset_pending` 或递增 `generation`，让对应 append 线程在下一次回调开始时清理自己的线程局部状态。
+
+generation 方案示意：
+
+```text
+truncate线程：
+  slot[node].generation++
+  slot[node].reset_pending = true
+
+append线程：
+  读取generation
+  发现reset_pending后自行clean
+  执行check_xlog_buf
+  保存状态前再次比较generation
+  generation已变化则丢弃本次结果，不覆盖新状态
+```
+
+这可以避免 truncate 在线程 A 中直接清线程 B 正在使用的 TLS，也避免 append 线程在 truncate 后把旧状态重新保存回已经清理的 node slot。
+
+定位全零问题时首先确认“header”类型：
+
+```text
+WalRecord header 全零
+  → checker context/buffer clean竞争更可疑
+
+XLogPageHeader 全零
+  → 输入LSN、page定位、短读或零填充更可疑
+
+DCF entry head(term/index/key/size/checksum)全零
+  → storage truncate、entry生命周期或私有重建路径更可疑
+```
+
+## DCF truncate 后 entry 是否还会发送
+
+### 开源实现
+
+开源 DCF suffix truncate 不是把旧 index 填 0，而是：
+
+```text
+stream->last_index 回退
+entry cache 对应槽标记 invalid
+磁盘 segment 在目标 entry offset 执行 truncate
+segment->last_index 回退
+index_buf 只缩小逻辑 size
+```
+
+因此稳定状态下：
+
+```text
+leader自身truncate旧suffix
+  → 旧index超出新的last_index
+  → rep_appendlog_node不再获取或发送旧entry
+  → 同一index以后重新append时，发送的是新entry
+
+follower因term/index冲突truncate
+  → leader仍保留对应entry
+  → leader调整NEXT_INDEX并重新发送
+```
+
+已经在 truncate 前被 append 线程 `stg_get_entry()` 取出并增加引用的 entry 可能仍在途进入一次 CRC 回调或发送。开源 cache 通过 `valid + ref_count` 延迟释放，磁盘读取返回独立 entry，因此 truncate 不应把已借出的 `ENTRY_BUF` 直接变成全零。
+
+如果非公开版本确实通过填 0 清理 index/header，需要额外确认：
+
+```text
+填0前是否等待entry引用归零
+truncate与stg_get_entry是否使用同一生命周期保护
+append线程拿到entry后，truncate是否仍能修改ENTRY_BUF(entry)
+rep_appendlog_node是否在发送前重新确认index仍在有效范围
+```
+
+只要 truncate 能修改已经交给 checker 的 buffer，就必须通过 refcount、不可变快照或整段锁消除并发修改。
+
+## 最小诊断日志
+
+### 接收端首次调用/重启
+
+```text
+thread_id
+startPtr / nbytes / startPtr % XLOG_BLCKSZ
+check_end_ptr
+is_first_check / is_remaining_xlog
+输入前40～64字节
+DCF replay index / entry key / entry len
+```
+
+### 发送端 entry
+
+```text
+thread_id / node_id / stream_id
+index / entry_type / source(cache|disk)
+entry_start_lsn / entry_end_lsn / entry_len
+previous check_end_ptr
+是否发生clean以及原因
+context slot generation
+```
+
+### `check_crc()` 异常分支
+
+```text
+candidate_record_start
+candidate_end_ptr
+old latest_end_ptr
+xl_tot_len / xl_is_new / xl_recflags
+IS_RECORD_ENCRYPTED
+stored_crc / calculated_crc / crc_match
+is_first_check / is_remaining_xlog
+ready_data_len / header_saved_len
+采取动作：commit / resync / skip / panic
+```
+
+特别记录：
+
+```text
+is_first_check && IS_RECORD_ENCRYPTED && CRC_MISMATCH
+```
+
+只要捕获到该分支仍推进 `latest_end_ptr`，接收端根因即可完全闭环。
+
+偶现问题不适合打印每条 record。建议在线程或 node slot 中保留最近 8～16 个事件的循环历史，失败时一次性输出或从 core 读取。
+
+## Core 取证
+
+core 只能保存崩溃时仍存在的状态，不能恢复已被覆盖的 fake record A。建议至少检查：
+
+```gdb
+thread apply all bt full
+thread <walreceiverwriter-or-append-thread>
+frame <check_crc-frame>
+
+p/x $t_thrd->thrdlocal_xlog_check_cxt.latest_check_ptr
+p/x $t_thrd->thrdlocal_xlog_check_cxt.latest_end_ptr
+p/x $t_thrd->thrdlocal_xlog_check_cxt.check_end_ptr
+p $t_thrd->thrdlocal_xlog_check_cxt.latest_wal_record_valid_size
+p $t_thrd->thrdlocal_xlog_check_cxt.ready_data_len
+p $t_thrd->thrdlocal_xlog_check_cxt.is_remaining_xlog
+p $t_thrd->thrdlocal_xlog_check_cxt.is_first_check
+x/64bx $t_thrd->thrdlocal_xlog_check_cxt.latest_wal_record
+```
+
+要回溯第一次污染位置，必须增加前述循环历史或在 TDE mismatch 静默分支保存一份固定 header 快照。
+
+## 物理字节与 record CRC 的区分
+
+沿相同 `[start_lsn, end_lsn)` 可以建立四个物理 hash 观测点：
+
+```text
+A. openGauss调用dcf_write前的原始WAL
+B. DCF leader磁盘读取/header-only重建后的send_buf
+C. follower ReceiveLogCbFunc收到的entry payload
+D. walreceiverwriter实际写盘的字节
+```
+
+- 物理 hash/checksum 覆盖完整 entry 字节，包含 WAL page header 和 padding，不要求 record 对齐；
+- WAL record CRC 覆盖逻辑 record，跳过物理 page header 和 padding，并按原生顺序计算 data 与 fixed header。
+
+如果 A/B/C/D hash 一致而原生 `XLogReader` 通过，应优先定位自定义 checker；只有物理 hash 已经分叉时，才优先调查 header-only 重建、encode/decode 或 buffer 生命周期。
 
 ## 判定矩阵
 
 | 证据 | 更可能的结论 |
 | --- | --- |
-| 两个备机在相同 record LSN 上得到相同 stored/calculated CRC | 确定性公共问题，不像随机 TLS 残留 |
-| 主机原始 WAL、发送重建和两个备机物理 hash 完全相同，原生 XLogReader 通过 | 自定义 checker 的 record/page 状态机错误 |
-| 两个备机物理 hash 相同，但与主机原始 WAL 不同 | leader header-only body 重建错误 |
-| leader 重建 hash 与 follower callback hash 不同 | DCF encode、传输、decode 或 buffer 生命周期问题 |
-| DCF entry checksum 失败，原生 XLogReader 也在相同 record 失败 | 真实错误 WAL/body 的概率高 |
-| DCF checksum 失败，但原生 XLogReader 正常 | DCF checksum 的范围、长度或表示语义不一致 |
-| 只有发生 discontinuity reset 后才失败 | resync、continuation 或首条残缺 record 处理错误 |
-| 失败 record 的 `page_remain` 总在 `[4, SizeOfXLogRecord)` | 固定 XLogRecord header 跨页拼接错误 |
-| 只在 `entry_start/end` 跨 WAL segment 时失败 | header-only 跨 segment 文件读取错误 |
-| stored CRC 固定，但 calculated CRC 每次 core 都不同 | 未初始化状态、未完全 reset 或 buffer 并发覆盖 |
-| 备机 replay LSN 正常越过失败 record，redo 无原生 CRC 错误 | 自定义 checker 误报概率极高 |
+| `record_start` 落在原生 record body 中 | checker 已失去 record boundary，当前 CRC 无意义 |
+| `ready_data_len == fake xl_tot_len` | checker 正沿 fake record 长度稳定累计，不像单次 CRC 算法错误 |
+| 重启后相同 entry/LSN/CRC 持续 core | 相同输入触发确定性状态机问题，不代表 TLS 残留 |
+| 两个备机在相同位置 core | 公共输入或公共 checker bug，随机节点私有状态概率下降 |
+| 原生 XLogReader/redo 通过同一 record | 自定义 checker 误报概率极高 |
+| first-check encrypted mismatch 后推进 end ptr | TDE 绕过首次 resync，根因闭环 |
+| `wal_total_len=0` 后发生大长度减法 | 无符号下溢导致越界读取/core |
+| header 在校验中途变成全零 | 并发 clean、buffer 生命周期或私有 truncate 零填充 |
+| A/B/C/D 物理 hash 一致 | DCF 传输字节可信，检查 record/page 状态机 |
+| DCF entry checksum mismatch 但原生 WAL 正常 | checksum 的 buf/len/表示语义不一致 |
 
-## 最小定位顺序
+## 建议修复顺序
 
-按照下面顺序处理，可以减少一次性改动：
-
-1. 比较连续两次 core 是否为同一 DCF index、record LSN 和 calculated CRC；
-2. 确认备机 redo 是否能越过失败 record，或者使用原生 `XLogReader` 离线读取；
-3. 增加 A/B/C 三处相同物理 LSN 区间的 hash；
-4. 如果字节一致，检查 record 起点和 `page_remain`，优先排查固定 header 跨页；
-5. 如果字节不一致，检查 header-only 回读的跨 segment、短读和 WAL write/flush 时序；
-6. 第一轮证据不足时，再增加 `xlp_info/xlp_rem_len` 和逐 page hash，不要一开始打印所有 record 内容。
-
-## 受控环境中放大复现概率
-
-仅在测试环境中尝试：
-
-- 缩小 DCF entry cache，增加 disk miss；
-- 暂停一个 follower，再恢复使其批量追赶旧 index；
-- 制造 ACK 丢失、重传、rematch 或 applied index rewind；
-- 写入大量 WAL，并主动增加 WAL segment switch；
-- 制造包含 FPI 的大 record，使其跨多个 page；
-- 对比 header-only 优化开启和关闭；
-- 分别统计失败 record 是否跨 page、segment，固定 header 是否跨 page。
-
-目标不是构造某个业务 record 类型，而是放大物理边界。CRC 不解析 heap/btree 等 rmgr 业务含义；某类 record 更容易失败，通常是因为它更大、更容易跨 page/segment，或者触发 `XLOG_SWITCH`、continuation 和 padding 等特殊布局。
+1. 修复 `is_first_check` 与 TDE 判断优先级，首次 mismatch 必须先 resync；
+2. CRC 成功前不提交 `latest_end_ptr`，失败分支清理完整 fake record 状态；
+3. 在所有 `wal_total_len - header_size` 前增加上下界检查；
+4. 发送端不连续磁盘 entry 采用 clean + best-effort resync，unsynced 时不报错；
+5. truncate/reset 改为同线程处理的 `reset_pending/generation`，或用同一把锁覆盖完整校验事务；
+6. 对私有 header-only 版本确认 assembled `buf/len/key` 与最终发送完全一致；
+7. 用最小日志捕获第一次 fake encrypted record，而不是只分析最终 1 GiB fake record；
+8. 后续再优化首次 fake `xl_tot_len` 过大导致的大量累计和资源消耗。
 
 ## 源码坐标
 
 ### openGauss
 
 - `src/gausskernel/storage/access/transam/xlog.cpp`
-  - `CopyXLogRecordToWAL()`：固定 header 可以跨页，起始页只保证容纳 `xl_tot_len`；
-  - `XLogWritePaxos()`：DCF entry 的 `buf/nBytes/end LSN` 来源；
-  - `XLogSelfFlushWithoutStatus()`：大 record 写满 page/WAL cache 环回时，以物理 page boundary 推进 Paxos write；
-  - DCF 写入与本地 WAL write/flush 顺序。
+  - `CopyXLogRecordToWAL()`：record、page header 和 continuation 的物理布局；
+  - `XLogWritePaxos()`：DCF entry 的原始 `buf/nBytes/end LSN`。
 - `src/gausskernel/storage/access/transam/xloginsert.cpp`
   - `XLogRecordAssemble()`：形成 `xl_tot_len` 和初始 CRC。
 - `src/gausskernel/storage/access/transam/xlogreader.cpp`
-  - `ValidXLogRecordHeader()`：record header 合法性检查；
-  - `ValidXLogRecord()`：原生 CRC 计算和最终判定。
-- `src/include/access/xlog_basic.h`
-  - `XLogRecord`；
-  - `SizeOfXLogRecord`；
-  - `XLogRecordMaxSize`；
-  - `XLogPageHeaderData`。
+  - `ValidXLogRecordHeader()`；
+  - `ValidXLogRecord()`。
 - `src/gausskernel/storage/replication/dcf/dcf_callbackfuncs.cpp`
   - `ReceiveLogCbFunc()`；
-  - `XLogWalRcvReceive()` 前后的 index/LSN 推进。
+  - DCF entry 的 `key/len/startPtr` 与 walreceiver 接入。
+- `src/gausskernel/storage/replication/walreceiver.cpp`
+  - `XLogWalRcvReceive()`：写入 walreceiver 环形缓冲。
 - `src/gausskernel/storage/replication/walrcvwriter.cpp`
-  - `walRcvWrite()`；
-  - `XLogWalRcvWrite()`。
+  - `walRcvWrite()`：取 `buf/nbytes/startPtr` 并写盘。
 
 ### DCF
 
 - `src/replication/rep_leader.c`
-  - `rep_appendlog_node()`：按 follower/index 获取并编码 entry；
-  - `NEXT_INDEX` 前进、回退和重传。
-- `src/replication/rep_common.c`
-  - `rep_apply_proc()`：回调成功后才推进 applied index。
-- `src/storage/stream.c`
-  - `stream_append_entry()`；
-  - `stream_get_entry()`；
-  - entry cache 回收。
-- `src/storage/log_storage.c`
-  - `storage_get_entry()`：cache miss 后从 segment 读取。
-- `src/storage/segment.c`
-  - entry header/data checksum 的读取和验证。
+  - `rep_appendlog_node()`：逐 index 获取 entry、拼包和发送；
+  - `NEXT_INDEX` 回退、rematch 和重传；
+  - `g_append_thread_id[node_id]`：node 到 append 线程的固定映射。
 - `src/replication/rep_msg_pack.c`
-  - `rep_encode_one_log()`；
-  - `rep_decode_one_log()`。
+  - `rep_encode_one_log()`：最终发送 `ENTRY_BUF/ENTRY_SIZE/key`。
+- `src/storage/stream.c`
+  - `stream_get_entry()`：cache 优先、disk fallback；
+  - `stream_trunc_suffix()`：回退 `last_index` 并清理 suffix cache。
+- `src/storage/log_storage.c`
+  - `storage_get_entry()`；
+  - `storage_trunc_suffix()`。
+- `src/storage/segment.c`
+  - `segment_get_entry()`：磁盘 entry header/data checksum；
+  - `segment_trunc_suffix()`：文件 truncate 和 index buffer resize。
+- `src/storage/stg_manager.h`
+  - `valid/ref_count`：truncate 后已借出 entry 的生命周期保护。
 
-## 尚未确认的问题
+## 尚待确认
 
-- 私有 header-only 优化中，原始 WAL 长度和 DCF 实际落盘长度分别保存在哪个字段；
-- 私有 checksum 的两次计算是否覆盖相同的字节范围；
-- 出错 record 是否稳定满足固定 `XLogRecord` header 跨页条件；
-- 两个备机失败时的 `record_start/xl_tot_len/calculated CRC` 是否完全相同；
-- 第一次 core 前的 DCF index 是否已经写入备机 WAL 文件，以及重启后是重写还是只重新校验；
-- 原生 redo/XLogReader 是否可以通过同一个失败 record；
-- CRC checker 在 discontinuity reset 后是否从 page 中间猜测 record 起点；
-- checker 是否错误地用 `record_start_lsn + xl_tot_len` 计算跨页 record 的物理 end LSN。
+- 接收端重启后第一条重发 entry 的 `index/key/len/start_lsn`，以及该 `start_lsn` 是否位于原生 record body；
+- 第一次 fake record A 的 header 字节、`IS_RECORD_ENCRYPTED` 结果、CRC 和 candidate end；
+- 私有版本 truncate 是否确实通过填 0 修改 index/header，以及是否可能修改已借出的 `ENTRY_BUF`；
+- 发送端曾经 core 的“全零 header”究竟是 `WalRecord`、`XLogPageHeader` 还是 DCF entry head；
+- first-check 跳页分支是否完整清理提前更新的 `latest_end_ptr` 和 fake record 状态；
+- 私有 header-only entry 的 `original_wal_len`、stored reference len 和 assembled send len 是否始终一致。
 
 ## 相关笔记
 
