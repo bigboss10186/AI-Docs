@@ -8,7 +8,7 @@
 | 类型 | 排障复盘 |
 | 状态 | 可用 |
 | 创建时间 | 2026 年 8 月 23 日 |
-| 更新时间 | 2026 年 8 月 27 日 |
+| 更新时间 | 2026 年 9 月 17 日 |
 
 ## 目标与范围
 
@@ -23,7 +23,123 @@
 
 DCF entry 的完整切分、网络重组和 walreceiver 缓冲流程见 [DCF 模式下 XLog Entry 的切分、传输与落盘流程](dcf-xlog-transport-flow.md)。
 
-## 当前结论摘要
+## 2026-09-17 最新交接：注入漏检与发送端输入缺口
+
+本节用于“加载 DCF CRC 记忆 / DCF XLOG CRC 调试背景”时恢复最新上下文。来源是历史会话“总结DCF XLOG CRC调试背景”“加载DCF CRC记忆”、本次用户确认，以及本地 DCF/openGauss 源码核对。以下明确区分实际观察、历史代码摘录、已采用修改和待验证假设；旧章节中的 TDE 根因推测、状态机建议和伪代码不等于当前实现。
+
+### 当前实际问题与约束
+
+- 目标是在避免边界误判造成 PANIC 的同时，验证真实 WAL 损坏能被有效检测；允许失步恢复时保守漏检，但不能因此宣称已全量覆盖。
+- 用户实验中发送端基本未拦住注入异常；接收端约一半实验能拦住。这是实验检出比例，不是整体 CRC 覆盖率。
+- 用户根据日志观察：中间约 1/2～2/3 区间可以校验；重传造成输入回退时才会 clean 并丢弃一部分校验范围。不是始终跳页，也不是一直未恢复就再次 clean。接收端也有少量不连续。
+- 每次实验需要重新部署集群，WAL 和 LSN 都会变化，无法在当前测试环境稳定控制真实 DCF 重传。不要要求每轮修改硬编码 LSN，也不要反复要求用户增加已有的入口、clean、跳页日志。
+- 注入包括 segment 偏移 0 的 long page header，以及不同位置的 record header/body；用户也尝试过第二页和最后一条 record，不能只用“总选段首”解释所有漏检。short page header 与 record header 是不同结构，讨论中应明确注入对象。
+- 用户确认：CRC 的 offset/latest_end_ptr 推进只改变检查范围，不改变实际发送的 ENTRY_BUF/ENTRY_SIZE。重试或 PANIC 可以影响发送进程，但正常跳过检查不等于跳过发送。
+
+### 当前实现基线：用户已确认，不能再套用旧问题
+
+历史摘录与用户确认得到的主要路径：
+
+```text
+check_end_ptr 有效且 startPtr != check_end_ptr
+  → clean_check_thrdlocal_args()
+  → 首次恢复时非 page 对齐则跳残页
+  → 符合现有零页条件时跳到 segment 边界
+  → latest_end_ptr 保存跨调用跳过目标
+  → 后续 move_to_prev_xlog_end 推进到目标
+  → proc_page_header 处理页头和缺少 record header 的 continuation
+  → 恢复完整 record 校验
+```
+
+关键修改：
+
+1. first-check 对齐后执行 `latest_end_ptr = Max(latest_end_ptr, startPtr + offset)`，目标可以超出当前 nbytes；后续连续 buffer 继续跳到该目标。这是有意设计，不能截断成当前 buffer 末尾，否则可能再次丢失边界。
+2. `proc_page_header()` 推进后的目标也通过 latest_end_ptr 保存，覆盖 continuation 跳过超过当前 buffer 的情况。
+3. 9 月 17 日用户已改成“实际触发跳过才 continue”；没有推进则进入当前页正常检查。不能再把旧版无条件 continue 认定为现版本原因。
+4. 当前 `is_first_check` 用于一次性首次恢复，用户对齐后将其置 false；不能强行把这个字段等同于“已经有一条 record CRC 成功”，更不能仅要求一直保持 true，造成循环反复对齐。
+5. 历史 CONTRECORD 摘录是 `offset += Min(MAXALIGN(page_header_rem_len), XLOG_BLCKSZ - page_header_size)`，条件为 CONTRECORD 且 `is_remaining_xlog == false`。缺少原 record header 时会跳过其 continuation，盲区可能跨多页。
+
+这些是历史片段和用户确认的实现基线，仍不是同一版本的完整源码快照。附件中“全零扫描后 return”“CONTRECORD 改成 return false”等助手建议，不能未经确认当作已采用代码。
+
+### 9 月 16 日 18:44 实验：可直接复用的原始范围证据
+
+同一轮、node_id=3 的日志与脚本输出：
+
+| 项目 | LSN 或范围 |
+| --- | --- |
+| 注入 record | `[0/21000198, 0/210001F6)` |
+| 修改位置 | `0/210001B8`，body 模式 |
+| 原始/修改后字节 | `826bae22 → 7d9451dd` |
+| 前一次 checker 输入 | start=`0/20FFF838`，nbytes=1176=`0x498` |
+| 前一次输入结束 | `0/20FFFCD0` |
+| 后一次 checker 输入 | start=`0/210001F8`，nbytes=192=`0xC0` |
+| 后一次输入结束 | `0/210002B8` |
+| 日志所示输入缺口 | `[0/20FFFCD0, 0/210001F8)`，1320 字节 |
+| 后一次残页对齐目标 | `0/21002000`，offset 增加 7688=`0x1E08` |
+| 恢复解析的日志 | start=`0/21001FE0`，nbytes=216，latest_check_ptr=`0/21002058` |
+
+后续 startPtr 从 `0/210002B8`、`0/21000750`、`0/21000BE8` 等连续推进，在到达目标前 latest_check_ptr 为 0；之后出现 `0/21002058`，并继续推进到 `0/210020B8` 等。这支持“局部跳过后恢复”，不是所有调用都 clean。
+
+严格结论：在这组记录的前后两次 checker 输入之间，整条注入 record 落在缺口中；后一次 first-check 又跳过 `[0/210001F8, 0/21002000)`，但不能说这个跳页动作跳掉了更早的 `0/210001B8`。还需确认是否有其他调用覆盖目标，以及对应 entry 在实际发送路径中的情况。
+
+值得追踪的关系：`0/210001F8` 正好是注入 record 结束 `0/210001F6` 后的 8 字节对齐位置。这个关系是观测事实，不证明“注入导致 DCF 自动绕开 record”。
+
+另一轮 18:09 的注入位置是 `0/21000100`、record 起点 `0/210000E0`、跳页日志 start=`0/21000200`。不能把它与上述 18:44 的 nbytes、record 或注入字节拼成同一次实验。9 月 17 日的 `0/21000068`、备机 start=`0/21000000`/nbytes=4992 等也应按各自实验分开。
+
+### 历史分析中明确排除或纠正的说法
+
+- 只看到 context-lost 日志不能断言“每次 entry 都不连续、CRC 一直空转”；要结合全部 start+nbytes 序列。
+- 用户已说明部分重复日志来自给两个备机发送；相同 LSN 两次打印不能单独证明重传。
+- 用户已确认相关注入实验 from_disk=true；不能把输入缺口直接断言为 cache hit/from_disk=false。
+- 历史助手曾把 `0x2000 - 0x1F8` 算成 7680，得出 `0/21001FF8`。正确是 7688，目标 `0/21002000`；这是分析计算错误，不是源码对齐错误。
+- “buf 太小，所以永远无法校验”“latest_end_ptr 在 buffer 外就是 bug”不成立，现有跨调用目标保存正是为此设计。
+- `latest_check_ptr` 不是输入结束位置；不能用它与 startPtr 的差直接证明 gap，应使用 check_end_ptr 或前次 start+nbytes。
+- long header 未出现在 checker 输入中，不等于 DCF 实际没有发送；checker 内部跳过也不改变实际发送内容。
+- “备机自己生成了正确 long header”“所有重传都保证 record 对齐”均未得到证明。几个由 pg_xlogdump 确认的 record 对齐样本不能提升为通用保证。
+
+### 本地源码能确认什么
+
+本地仓库：`/Users/bigboss/code/sql/DCF` 与 `/Users/bigboss/code/sql/openGauss-server`。
+
+- DCF `src/storage/stg_manager.h` 中 ENTRY_KEY 读取 entry 元数据，ENTRY_BUF 跳过 DCF 自己的 44 字节 header，不跳过 WAL long header。标准路径 start=`ENTRY_KEY-ENTRY_SIZE` 必须对应 ENTRY_BUF[0] 的物理 LSN。
+- openGauss `XLogWritePaxos()` 从物理 WAL buffer 连续取 nBytes，传入 `key=原始起点+nBytes`；没有寻找第一条 record 或主动去掉 long header 的逻辑。私有 CTRL_LOG_MODE 重建后的 buf/size/key 是否仍一致需另核对。
+- DCF `rep_check_appendlog_ack()` 在 ERR_APPEN_LOG_REQ_LOST 时将 NEXT_INDEX 设为 MATCH_INDEX.index+1，rematch 也可能回退。已有日志包括 `append log may be lost.reset next index`、`pre log is mismatch,reset next index`。
+- APPEND_INTERVAL=1000 ms 是定时发送条件，可以发送空请求，不等于每秒必然重传数据。
+- 接收侧 `stream_check_conflict()` 忽略已 applied 或相同 term/index 的重复 entry；`rep_apply_proc()` 从 applied_index+1 顺序回调，成功才推进。因此网络重传不等于 walreceiverwriter 重复消费同一份字节。已经存储的 entry 可能使后来重传的注入内容不被采用；这是待核实的实验条件，不是本轮已确定原因。
+- 本地开源仓没有实际修改的 check_xlog_buf、DCF CRC 状态切换/重置及私有发送前回调。历史私有路径还包括 `rep_appendlog_encode_and_send()`、`segment_get_entry_for_ctrl_log()`、`g_stg_cb_read_by_key()`，不能假定与本地函数完全相同。
+
+### 下一步：只补两个外层观测点，先定位输入缺口
+
+当前最重要的问题是“覆盖注入点的 entry 在哪里”，不要为了这个缺口继续修改已经确认的跳页机制。
+
+明确分三层：
+
+```text
+实际选择并提交发送的 entry 范围
+  → 传给 CRC 回调的范围
+  → checker 实际校验的范围
+```
+
+已有 checker 的 startPtr/nbytes、clean、对齐日志。下一轮只补外层对应关系：
+
+1. `stg_get_entry()` 及私有 body 重建完成之后、CRC 调用条件之前打印 PRE_CHECK：node_id、index、term、key、实际 payload size、start=key-size、buf 指针、是否调用 CRC/未调用原因、crc_retry。
+2. `rep_encode_one_log()` 前打印 PRE_ENCODE：同一组 node/index/term/key/size/start/buf/crc_retry，核对两处是否一致。
+3. 如需证明实际提交发送成功，关联本批次发送返回值；PRE_ENCODE 仅证明到达编码位置，不证明备机收到或采用了数据。
+
+每轮部署后照常注入，保存本轮 record_start、inject_lsn、修改前后字节及时间，事后用 `key-size <= inject_lsn < key` 筛选。地址每轮变化不影响日志代码，不要求固定重传、不要求硬编码 LSN、不需要首先新增更多 CRC 内部日志。
+
+| 结果 | 下一步 |
+| --- | --- |
+| PRE_CHECK 覆盖注入点，但不调用 CRC | 查回调过滤条件 |
+| 决定调用 CRC，但 checker 入口范围不同 | 查回调参数、重建长度、指针和日志位置 |
+| checker 收到正确范围，目标 record 随后被跳过 | 已确认恢复盲区，再评估恢复策略 |
+| PRE_CHECK 与 PRE_ENCODE 范围不同 | 查二者之间修改 entry 的路径 |
+| 两处均没有覆盖注入点的 entry | 向上追 index 选择、stg_get_entry 返回失败、重建失败和跳过分支 |
+| 已覆盖、未跳过、仍不报错 | 再核对实际字节、record 完整性及 CRC/TDE/重试判定 |
+
+按同一 node+index+时间顺序关联，不混合两个备机或不同实验。用户希望先使用已有会话和日志推进，避免反复要求重部署、随机换注入点或重复打点。
+
+## 历史结论摘要（截至 2026-08-27）
 
 ### 接收端
 
